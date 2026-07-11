@@ -128,6 +128,7 @@ markers = [
     "openmm: tests using OpenMM software; skip if unavailable",
     "optking: tests using OptKing software; skip if unavailable",
     "optking_v2: tests using OptKing QCSchema-v2-compatible software; skip if unavailable",
+    "orca: tests using ORCA software; skip if unavailable",
     "psi4: tests using Psi4 software; skip if unavailable",
     "qcdb: tests using QCDB software; skip if unavailable",
     "qchem: tests using Q-Chem software; skip if unavailable",

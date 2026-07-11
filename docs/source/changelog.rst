@@ -44,6 +44,9 @@ Breaking Changes
 
 New Features
 ++++++++++++
+- ORCA - new harness supporting energy, gradient (``EnGrad``, incl. RIJCOSX), and Hessian
+  (``Freq``, analytic for DFT) by parsing ORCA's native stdout/``.engrad``/``.hess`` files.
+  ORCA-specific options pass through the ``simple_input`` and ``blocks`` keywords. @stvogt
 
 Enhancements
 ++++++++++++
