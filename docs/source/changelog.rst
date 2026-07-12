@@ -44,6 +44,9 @@ Breaking Changes
 
 New Features
 ++++++++++++
+- Gaussian - new harness for Gaussian 16 supporting energy, gradient (``Force``), and
+  Hessian (``Freq``) with formatted-checkpoint-based parsing. Gaussian-specific options
+  pass through the ``route_input`` and ``link0`` keywords. @stvogt
 
 Enhancements
 ++++++++++++
