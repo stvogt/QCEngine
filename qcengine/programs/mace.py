@@ -103,12 +103,26 @@ class MACEHarness(ProgramHarness):
         # set the cell as None and mace will automatically create a cell big enough to include all atoms
         cell = None
 
-        config = Configuration(
-            atomic_numbers=atomic_numbers,
-            positions=input_data.molecule.geometry * ureg.conversion_factor("bohr", "angstrom"),
-            pbc=pbc,
-            cell=cell,
-        )
+        # mace >= 0.3.10 made `properties`/`property_weights` required
+        # Configuration arguments (training labels; empty for inference).
+        # Fall back to the old signature for older mace versions.
+        positions = input_data.molecule.geometry * ureg.conversion_factor("bohr", "angstrom")
+        try:
+            config = Configuration(
+                atomic_numbers=atomic_numbers,
+                positions=positions,
+                pbc=pbc,
+                cell=cell,
+                properties={},
+                property_weights={},
+            )
+        except TypeError:
+            config = Configuration(
+                atomic_numbers=atomic_numbers,
+                positions=positions,
+                pbc=pbc,
+                cell=cell,
+            )
 
         data_loader = DataLoader(
             dataset=[AtomicData.from_config(config, z_table=z_table, cutoff=r_max)],
