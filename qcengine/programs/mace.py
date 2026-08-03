@@ -1,4 +1,4 @@
-from typing import TYPE_CHECKING, Any, ClassVar, Dict, Union
+from typing import TYPE_CHECKING, Any, ClassVar, Dict, Optional, Tuple, Union
 
 from qcelemental.models.v2 import AtomicResult, FailedOperation, Provenance
 from qcelemental.util import safe_version, which_import
@@ -11,6 +11,51 @@ if TYPE_CHECKING:
     from qcelemental.models.v2 import AtomicInput, FailedOperation
 
     from qcengine.config import TaskConfig
+
+
+def _parse_periodic_keywords(
+    keywords: Optional[Dict[str, Any]],
+) -> Tuple[Tuple[bool, bool, bool], Optional[Any]]:
+    """Extract MACE periodic-boundary settings from a QC-spec keywords dict.
+
+    Recognised keys (both optional):
+        ``pbc``:  length-3 iterable of bools (per-axis periodicity)
+        ``cell``: 3x3 lattice vectors in Angstrom
+
+    Returns ``(pbc, cell)`` suitable for a ``mace.data.utils.Configuration``.
+    When ``pbc`` is absent or entirely False the harness runs non-periodic
+    (``pbc=(False,False,False)``, ``cell=None``) — the historical default,
+    which lets MACE auto-size a box around the atoms. When any pbc axis is
+    True, a matching 3x3 ``cell`` must be supplied or ``InputError`` is
+    raised so periodic runs never silently fall back to non-periodic.
+    """
+    import numpy as np
+
+    kw = keywords or {}
+    kw_pbc = kw.get("pbc")
+    kw_cell = kw.get("cell")
+
+    if kw_pbc is None or not any(bool(x) for x in kw_pbc):
+        return (False, False, False), None
+
+    pbc_tuple = tuple(bool(x) for x in kw_pbc)
+    if len(pbc_tuple) != 3:
+        raise InputError(
+            f"MACE harness: keywords['pbc'] must be length 3 (got {len(pbc_tuple)})."
+        )
+    if kw_cell is None:
+        raise InputError(
+            "MACE harness: periodic boundary conditions requested "
+            f"(keywords['pbc'] = {list(pbc_tuple)}) but no cell supplied. "
+            "Set keywords['cell'] to a 3x3 list of lattice vectors in Angstrom."
+        )
+    cell = np.asarray(kw_cell, dtype=float)
+    if cell.shape != (3, 3):
+        raise InputError(
+            "MACE harness: keywords['cell'] must be a 3x3 matrix "
+            f"(got shape {cell.shape})."
+        )
+    return pbc_tuple, cell
 
 
 class MACEHarness(ProgramHarness):
@@ -99,9 +144,10 @@ class MACEHarness(ProgramHarness):
 
         z_table = AtomicNumberTable([int(z) for z in atomic_numbers])
         atomic_numbers = input_data.molecule.atomic_numbers
-        pbc = (False, False, False)
-        # set the cell as None and mace will automatically create a cell big enough to include all atoms
-        cell = None
+        # Read pbc / cell from the QC specification keywords (both optional).
+        # Default is non-periodic — cell=None lets mace auto-size a box around
+        # the atoms, matching the harness's pre-existing behaviour.
+        pbc, cell = _parse_periodic_keywords(input_data.specification.keywords)
 
         # mace >= 0.3.10 made `properties`/`property_weights` required
         # Configuration arguments (training labels; empty for inference).
