@@ -7,16 +7,136 @@ Therefore, this harness only has to provide a thin wrapper to integrate the
 respective dispersion correction.
 """
 
-from typing import Any, ClassVar, Dict
+from typing import Any, ClassVar, Dict, Optional, Tuple
 
 import qcelemental
-from qcelemental.models.v2 import AtomicInput, AtomicResult, FailedOperation
+from qcelemental.models.v2 import AtomicInput, AtomicResult, FailedOperation, Provenance
 from qcelemental.util import parse_version, safe_version, which_import
 
 from ..config import TaskConfig
 from ..exceptions import InputError, ResourceError
+from ..units import ureg
 from .empirical_dispersion_resources import from_arrays, get_dispersion_aliases
 from .model import ProgramHarness
+
+_ANG2BOHR = ureg.conversion_factor("angstrom", "bohr")
+
+
+def _parse_periodic_keywords(
+    keywords: Optional[Dict[str, Any]],
+):
+    """Extract periodic-boundary settings from a QC-spec keywords dict.
+
+    Returns ``(lattice_bohr, pbc)`` where:
+    - ``lattice_bohr`` is a numpy (3, 3) array (Angstrom cell → Bohr), or ``None``
+    - ``pbc`` is a numpy length-3 bool array, or ``None``
+
+    Both are ``None`` when the keywords don't request periodicity (either
+    ``pbc`` is missing or every axis is False) — that path defers to the
+    non-periodic qcschema route, byte-identical to prior behaviour.
+
+    Any-pbc-True with no cell → ``InputError`` (never silently non-periodic).
+    Bad shapes → ``InputError``. Recognised keys:
+        ``pbc``:  length-3 iterable of bools
+        ``cell``: 3x3 lattice vectors in Angstrom
+    """
+    import numpy as np
+
+    kw = keywords or {}
+    kw_pbc = kw.get("pbc")
+    kw_cell = kw.get("cell")
+
+    if kw_pbc is None or not any(bool(x) for x in kw_pbc):
+        return None, None
+
+    pbc_arr = np.asarray([bool(x) for x in kw_pbc])
+    if pbc_arr.shape != (3,):
+        raise InputError(
+            f"Dispersion harness: keywords['pbc'] must be length 3 (got {pbc_arr.shape})."
+        )
+    if kw_cell is None:
+        raise InputError(
+            "Dispersion harness: periodic boundary conditions requested "
+            f"(keywords['pbc'] = {list(pbc_arr)}) but no cell supplied. "
+            "Set keywords['cell'] to a 3x3 list of lattice vectors in Angstrom."
+        )
+    lattice_ang = np.asarray(kw_cell, dtype=float)
+    if lattice_ang.shape != (3, 3):
+        raise InputError(
+            "Dispersion harness: keywords['cell'] must be a 3x3 matrix "
+            f"(got shape {lattice_ang.shape})."
+        )
+    return lattice_ang * _ANG2BOHR, pbc_arr
+
+
+def _resolve_d3_damping_class(level_hint: Optional[str], method: Optional[str]):
+    """Pick the s-dftd3 DampingParam class for a given damping variant.
+
+    Resolution order: ``level_hint`` (if set) then the trailing suffix of
+    ``method`` (e.g. ``-d3bj``). Falls back to ``RationalDampingParam``
+    (D3BJ) when neither is recognised, matching s-dftd3's own default.
+    """
+    from dftd3.interface import (
+        RationalDampingParam,
+        ZeroDampingParam,
+        ModifiedRationalDampingParam,
+        ModifiedZeroDampingParam,
+        OptimizedPowerDampingParam,
+    )
+
+    tag = (level_hint or method or "").lower()
+    if "d3mbj" in tag:
+        return ModifiedRationalDampingParam
+    if "d3mzero" in tag or "d3m0" in tag:
+        return ModifiedZeroDampingParam
+    if "d3op" in tag:
+        return OptimizedPowerDampingParam
+    if "d3zero" in tag or tag.endswith("-d3") or tag == "d3":
+        return ZeroDampingParam
+    return RationalDampingParam
+
+
+def _build_atomic_result(
+    input_model: AtomicInput,
+    input_data: Dict[str, Any],
+    energy: float,
+    gradient,
+    creator: str,
+    version: str,
+    dispersion_key: str,
+    qcvkey: Optional[str],
+) -> AtomicResult:
+    """Wrap a native-API dispersion result in an AtomicResult, matching the
+    non-periodic path's qcvars payload so downstream consumers don't drift."""
+    import numpy as np
+
+    driver = input_model.specification.driver
+    return_result = energy if driver == "energy" else np.asarray(gradient).ravel().tolist()
+
+    calcinfo: Dict[str, Any] = {
+        "CURRENT ENERGY": energy,
+        "DISPERSION CORRECTION ENERGY": energy,
+    }
+    if qcvkey:
+        calcinfo[f"{qcvkey} DISPERSION CORRECTION ENERGY"] = energy
+    if driver == "gradient":
+        grad_list = np.asarray(gradient).ravel().tolist()
+        calcinfo["CURRENT GRADIENT"] = grad_list
+        calcinfo["DISPERSION CORRECTION GRADIENT"] = grad_list
+        if qcvkey:
+            calcinfo[f"{qcvkey} DISPERSION CORRECTION GRADIENT"] = grad_list
+
+    ret_data: Dict[str, Any] = {
+        "input_data": input_data,
+        "molecule": input_model.molecule,
+        "properties": {"return_energy": energy},
+        "return_result": return_result,
+        "provenance": Provenance(creator=creator, version=version, routine=f"{creator}.native-periodic"),
+        "schema_name": "qcschema_atomic_result",
+        "success": True,
+        "extras": {"qcvars": calcinfo, dispersion_key: {"periodic": True}},
+    }
+    return AtomicResult(**ret_data)
 
 
 class DFTD4Harness(ProgramHarness):
@@ -60,11 +180,18 @@ class DFTD4Harness(ProgramHarness):
         """
         Actual interface to the dftd4 package. The compute function is just a thin
         wrapper around the native QCSchema interface of the dftd4 Python-API.
+
+        Periodic mode: when ``keywords['cell']`` (3x3 Angstrom lattice) and
+        ``keywords['pbc']`` (length-3 bools) are set and any pbc axis is True,
+        the harness bypasses ``run_qcschema`` (which is non-periodic because
+        QCSchema Molecules can't carry a cell) and calls ``dftd4.interface``
+        directly with lattice + periodic. Non-periodic path is unchanged.
         """
 
         self.found(raise_error=True)
 
         import dftd4
+        import numpy as np
         from dftd4.qcschema import run_qcschema
 
         # strip engine hint
@@ -74,6 +201,26 @@ class DFTD4Harness(ProgramHarness):
             method = method[3:]
             input_data["specification"]["model"]["method"] = method
         qcvkey = method.upper() if method is not None else None
+
+        # Periodic branch — bypass qcschema (which is inherently non-periodic)
+        lattice_bohr, pbc = _parse_periodic_keywords(input_model.specification.keywords)
+        if lattice_bohr is not None:
+            from dftd4.interface import DispersionModel, DampingParam
+            numbers = np.asarray(input_model.molecule.atomic_numbers, dtype=int)
+            positions_bohr = np.asarray(input_model.molecule.geometry, dtype=float).reshape(-1, 3)
+            model = DispersionModel(numbers, positions_bohr, lattice=lattice_bohr, periodic=pbc)
+            # dftd4's DampingParam takes method= plus keyword-value tweaks
+            damping_kw = {"method": method} if method else {}
+            damping_kw.update(input_model.specification.keywords.get("params_tweaks", {}) or {})
+            param = DampingParam(**damping_kw)
+            res = model.get_dispersion(param, grad=(input_model.specification.driver == "gradient"))
+            return _build_atomic_result(
+                input_model, input_data,
+                energy=float(res["energy"]),
+                gradient=res.get("gradient"),
+                creator="dftd4", version=dftd4.__version__,
+                dispersion_key="dftd4", qcvkey=qcvkey,
+            )
 
         # send `from_arrays` the dftd4 behavior of functional specification overrides explicit parameters specification
         # * differs from dftd4 harness behavior where parameters extend or override functional
@@ -248,12 +395,20 @@ class SDFTD3Harness(ProgramHarness):
         """
         Actual interface to the dftd3 package. The compute function is just a thin
         wrapper around the native QCSchema interface of the dftd3 Python-API.
+
+        Periodic mode: when ``keywords['cell']`` (3x3 Angstrom lattice) and
+        ``keywords['pbc']`` (length-3 bools) are set and any pbc axis is True,
+        the harness bypasses ``run_qcschema`` and calls ``dftd3.interface``
+        directly with lattice + periodic. Damping variant is picked from
+        ``keywords['level_hint']`` (preferred) then a ``-d3*`` suffix on the
+        method name (fallback: RationalDampingParam / D3BJ).
         """
         self.found(raise_error=True)
         if parse_version(self.get_version()) < parse_version("0.5.1"):
             raise ResourceError("QCEngine's dftd3 wrapper requires version 0.5.1 or greater.")
 
         import dftd3
+        import numpy as np
         from dftd3.qcschema import run_qcschema
 
         # strip engine hint
@@ -263,6 +418,28 @@ class SDFTD3Harness(ProgramHarness):
             method = method[3:]
             input_data["specification"]["model"]["method"] = method
         qcvkey = method.upper() if method is not None else None
+
+        # Periodic branch — bypass qcschema (which is inherently non-periodic)
+        lattice_bohr, pbc = _parse_periodic_keywords(input_model.specification.keywords)
+        if lattice_bohr is not None:
+            from dftd3.interface import DispersionModel
+            numbers = np.asarray(input_model.molecule.atomic_numbers, dtype=int)
+            positions_bohr = np.asarray(input_model.molecule.geometry, dtype=float).reshape(-1, 3)
+            model = DispersionModel(numbers, positions_bohr, lattice=lattice_bohr, periodic=pbc)
+            damping_cls = _resolve_d3_damping_class(
+                input_model.specification.keywords.get("level_hint"), method,
+            )
+            damping_kw = {"method": method} if method else {}
+            damping_kw.update(input_model.specification.keywords.get("params_tweaks", {}) or {})
+            param = damping_cls(**damping_kw)
+            res = model.get_dispersion(param, grad=(input_model.specification.driver == "gradient"))
+            return _build_atomic_result(
+                input_model, input_data,
+                energy=float(res["energy"]),
+                gradient=res.get("gradient"),
+                creator="dftd3", version=dftd3.__version__,
+                dispersion_key="dftd3", qcvkey=qcvkey,
+            )
 
         # send `from_arrays` the s-dftd3 behavior of functional specification overrides explicit parameters specification
         # * differs from classic-dftd3 harness behavior where parameters extend or override functional
