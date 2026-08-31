@@ -227,16 +227,24 @@ class MACEHarness(ProgramHarness):
             shuffle=False,
             drop_last=False,
         )
-        input_dict = next(iter(data_loader)).to_dict()
         model.to(device)
+        # GPU-safe: move the input batch onto the model's device (no-op on CPU).
+        # Without this, model on cuda + data on cpu raises
+        # "Expected all tensors to be on the same device".
+        batch = next(iter(data_loader)).to(device)
+        input_dict = batch.to_dict()
         mace_data = model(input_dict, compute_force=True)
-        ret_data["properties"] = {"return_energy": mace_data["energy"] * ureg.conversion_factor("eV", "hartree")}
+        # Bring results back to host before pint/numpy/JSON serialization:
+        # .numpy() raises on CUDA tensors.
+        _energy = mace_data["energy"].detach().cpu()
+        _forces = mace_data["forces"].detach().cpu()
+        ret_data["properties"] = {"return_energy": _energy * ureg.conversion_factor("eV", "hartree")}
 
         if input_data.specification.driver == "energy":
-            ret_data["return_result"] = ret_data["properties"]["return_energy"].detach().numpy().item()
+            ret_data["return_result"] = ret_data["properties"]["return_energy"].numpy().item()
         elif input_data.specification.driver == "gradient":
             ret_data["return_result"] = (
-                np.asarray(-1.0 * mace_data["forces"] * ureg.conversion_factor("eV / angstrom", "hartree / bohr"))
+                np.asarray(-1.0 * _forces * ureg.conversion_factor("eV / angstrom", "hartree / bohr"))
                 .ravel()
                 .tolist()
             )

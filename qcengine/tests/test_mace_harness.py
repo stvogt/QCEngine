@@ -118,3 +118,51 @@ def test_missing_model_error_names_the_path_and_the_env_var(monkeypatch):
     msg = str(exc.value)
     assert "definitely-missing.model" in msg
     assert "MACE_MODEL_PATH" in msg
+
+
+# ---------------------------------------------------------------------------
+# GPU device handling. The harness moves the model to CUDA when available; the
+# input batch and the returned tensors must travel with it, or you get
+# "Expected all tensors to be on the same device" (inputs) or a .numpy() failure
+# on CUDA tensors (results). Neither shows up on a CPU-only box, which is how it
+# reached production twice.
+# ---------------------------------------------------------------------------
+
+def _has_cuda():
+    torch = pytest.importorskip("torch")
+    return torch.cuda.is_available()
+
+
+def test_mace_harness_moves_inputs_and_results_with_the_model():
+    """Source-level guard: runs everywhere, including CPU-only CI."""
+    import inspect
+
+    from qcengine.programs.mace import MACEHarness
+
+    src = inspect.getsource(MACEHarness.compute)
+    assert "next(iter(data_loader)).to(device)" in src, "input batch must move to the model's device"
+    assert '_energy = mace_data["energy"].detach().cpu()' in src, "energy must come back to host"
+    assert '_forces = mace_data["forces"].detach().cpu()' in src, "forces must come back to host"
+    # the pre-fix spellings must not creep back
+    assert "next(iter(data_loader)).to_dict()" not in src
+    assert 'mace_data["energy"] * ureg' not in src
+
+
+@pytest.mark.skipif(not _has_cuda(), reason="no CUDA device available")
+def test_mace_energy_matches_between_cpu_and_gpu(tmp_path, monkeypatch):
+    """On a GPU box, the CUDA and CPU paths must agree."""
+    import torch
+    import qcengine as qcng
+    import qcelemental as qcel
+
+    model = os.environ.get("MACE_TEST_MODEL")
+    if not model or not os.path.isfile(model):
+        pytest.skip("set MACE_TEST_MODEL to a local .model file")
+    mol = qcel.models.Molecule.from_data("O 0 0 0\nH 0.96 0 0\nH -0.24 0.93 0")
+    mk = lambda: qcel.models.AtomicInput(
+        molecule=mol, driver="energy", model={"method": model, "basis": None}, keywords={}
+    )
+    gpu = qcng.compute(mk(), "mace", raise_error=True).return_result
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: False)
+    cpu = qcng.compute(mk(), "mace", raise_error=True).return_result
+    assert gpu == pytest.approx(cpu, rel=1e-8)
