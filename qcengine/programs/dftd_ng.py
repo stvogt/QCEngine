@@ -96,6 +96,31 @@ def _resolve_d3_damping_class(level_hint: Optional[str], method: Optional[str]):
     return RationalDampingParam
 
 
+def _strip_dispersion_level(method: Optional[str], accept) -> Optional[str]:
+    """Drop a trailing dispersion-level alias from ``method`` ("mpwb1k-d3bj" -> "mpwb1k").
+
+    The dftd3/dftd4 parameter databases are keyed by the BARE functional, so the
+    suffixed spelling raises "No entry for 'mpwb1k-d3bj' present" /
+    "Functional 'mpwb1k-d4' not known". The non-periodic qcschema path strips this
+    before handing the name over; the periodic branches must do the same or they
+    reject exactly the spelling callers use.
+
+    ``accept`` filters which canonical levels this harness owns, mirroring the
+    predicate each non-periodic path already applies (d3: ``level.startswith("d3")``;
+    d4: ``level in {"d4bjeeqatm", "d4bjeeqtwo"}``).
+
+    Note the ordering constraint: :func:`_resolve_d3_damping_class` reads the
+    *suffixed* name to pick the damping form, so strip only after the class is
+    resolved and only for the parameter lookup.
+    """
+    if not method:
+        return method
+    for alias, level in get_dispersion_aliases().items():
+        if accept(level) and method.lower().endswith(alias):
+            return method[: -(len(alias) + 1)]
+    return method
+
+
 def _build_atomic_result(
     input_model: AtomicInput,
     input_data: Dict[str, Any],
@@ -209,8 +234,12 @@ class DFTD4Harness(ProgramHarness):
             numbers = np.asarray(input_model.molecule.atomic_numbers, dtype=int)
             positions_bohr = np.asarray(input_model.molecule.geometry, dtype=float).reshape(-1, 3)
             model = DispersionModel(numbers, positions_bohr, lattice=lattice_bohr, periodic=pbc)
-            # dftd4's DampingParam takes method= plus keyword-value tweaks
-            damping_kw = {"method": method} if method else {}
+            # dftd4's DampingParam takes method= plus keyword-value tweaks.
+            # Parameter DB is keyed by the bare functional (see _strip_dispersion_level).
+            method_bare = _strip_dispersion_level(
+                method, lambda level: level in ("d4bjeeqatm", "d4bjeeqtwo")
+            )
+            damping_kw = {"method": method_bare} if method_bare else {}
             damping_kw.update(input_model.specification.keywords.get("params_tweaks", {}) or {})
             param = DampingParam(**damping_kw)
             res = model.get_dispersion(param, grad=(input_model.specification.driver == "gradient"))
@@ -426,10 +455,15 @@ class SDFTD3Harness(ProgramHarness):
             numbers = np.asarray(input_model.molecule.atomic_numbers, dtype=int)
             positions_bohr = np.asarray(input_model.molecule.geometry, dtype=float).reshape(-1, 3)
             model = DispersionModel(numbers, positions_bohr, lattice=lattice_bohr, periodic=pbc)
+            # Resolve the damping form from the SUFFIXED name first, then strip the
+            # level for the parameter lookup (see _strip_dispersion_level).
             damping_cls = _resolve_d3_damping_class(
                 input_model.specification.keywords.get("level_hint"), method,
             )
-            damping_kw = {"method": method} if method else {}
+            method_bare = _strip_dispersion_level(
+                method, lambda level: level.startswith("d3")
+            )
+            damping_kw = {"method": method_bare} if method_bare else {}
             damping_kw.update(input_model.specification.keywords.get("params_tweaks", {}) or {})
             param = damping_cls(**damping_kw)
             res = model.get_dispersion(param, grad=(input_model.specification.driver == "gradient"))

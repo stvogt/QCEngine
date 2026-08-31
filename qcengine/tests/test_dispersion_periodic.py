@@ -9,6 +9,7 @@ from qcengine.exceptions import InputError
 from qcengine.programs.dftd_ng import (
     _parse_periodic_keywords,
     _resolve_d3_damping_class,
+    _strip_dispersion_level,
 )
 
 
@@ -168,3 +169,78 @@ def test_periodic_dftd3_returns_different_energy_from_nonperiodic():
     assert non_periodic.success and periodic.success
     assert non_periodic.properties.return_energy != periodic.properties.return_energy
     assert periodic.properties.return_energy < non_periodic.properties.return_energy
+
+
+# ---------------------------------------------------------------------------
+# _strip_dispersion_level — the parameter DBs are keyed by the BARE functional
+# ---------------------------------------------------------------------------
+
+_D3 = (lambda level: level.startswith("d3"))
+_D4 = (lambda level: level in ("d4bjeeqatm", "d4bjeeqtwo"))
+
+
+@pytest.mark.parametrize(
+    "method, accept, expected",
+    [
+        ("mpwb1k-d3bj", _D3, "mpwb1k"),
+        ("b3lyp-d3", _D3, "b3lyp"),
+        ("mpwb1k-d4", _D4, "mpwb1k"),
+        ("mpwb1k", _D3, "mpwb1k"),        # already bare -> unchanged
+        ("mpwb1k-d4", _D3, "mpwb1k-d4"),  # other harness's level -> untouched
+        (None, _D3, None),
+        ("", _D3, ""),
+    ],
+)
+def test_strip_dispersion_level(method, accept, expected):
+    assert _strip_dispersion_level(method, accept) == expected
+
+
+def test_strip_dispersion_level_is_idempotent():
+    once = _strip_dispersion_level("mpwb1k-d3bj", _D3)
+    assert _strip_dispersion_level(once, _D3) == once
+
+
+def _periodic_energy(harness_cls, method, keywords):
+    from qcelemental.models.v2 import AtomicInput
+    inp = AtomicInput(**{
+        "molecule": {"symbols": ["O", "H", "H"],
+                     "geometry": [0.0, 0.0, 0.0, 1.8, 0.0, 0.0, -0.45, 1.76, 0.0]},
+        "specification": {"model": {"method": method}, "driver": "energy",
+                          "keywords": keywords, "extras": {}},
+        "id": None,
+    })
+    out = harness_cls().compute(inp, None)
+    assert out.success
+    return out.properties.return_energy
+
+
+_CELL = {"cell": [[9.0, 0, 0], [0, 9.0, 0], [0, 0, 20.0]], "pbc": [True, True, False]}
+
+
+def test_periodic_dftd3_accepts_suffixed_method_name():
+    """Regression: the periodic branch used to hand 'mpwb1k-d3bj' straight to the
+    parameter DB and die with "No entry for 'mpwb1k-d3bj' present", while the
+    non-periodic path stripped the level first. Both spellings must now resolve to
+    the same MPWB1K D3BJ parameters."""
+    pytest.importorskip("dftd3")
+    from qcengine.programs.dftd_ng import SDFTD3Harness
+    suffixed = _periodic_energy(SDFTD3Harness, "mpwb1k-d3bj", dict(_CELL))
+    bare = _periodic_energy(SDFTD3Harness, "mpwb1k", {**_CELL, "level_hint": "d3bj"})
+    assert suffixed == pytest.approx(bare, rel=0, abs=1e-12)
+
+
+def test_periodic_dftd4_accepts_suffixed_method_name():
+    pytest.importorskip("dftd4")
+    from qcengine.programs.dftd_ng import DFTD4Harness
+    suffixed = _periodic_energy(DFTD4Harness, "mpwb1k-d4", dict(_CELL))
+    bare = _periodic_energy(DFTD4Harness, "mpwb1k", {**_CELL, "level_hint": "d4"})
+    assert suffixed == pytest.approx(bare, rel=0, abs=1e-12)
+
+
+def test_suffixed_periodic_still_differs_from_nonperiodic():
+    """Guard against 'fixing' the name handling by silently dropping periodicity."""
+    pytest.importorskip("dftd3")
+    from qcengine.programs.dftd_ng import SDFTD3Harness
+    periodic = _periodic_energy(SDFTD3Harness, "mpwb1k-d3bj", dict(_CELL))
+    non_periodic = _periodic_energy(SDFTD3Harness, "mpwb1k-d3bj", {})
+    assert periodic != non_periodic
