@@ -1,3 +1,4 @@
+import os
 from typing import TYPE_CHECKING, Any, ClassVar, Dict, Optional, Tuple, Union
 
 from qcelemental.models.v2 import AtomicResult, FailedOperation, Provenance
@@ -95,29 +96,79 @@ class MACEHarness(ProgramHarness):
 
         return self.version_cache[which_prog]
 
+    MODEL_PATH_ENV: ClassVar[str] = "MACE_MODEL_PATH"
+
+    @classmethod
+    def resolve_model_path(cls, name: str) -> str:
+        """Resolve a model reference to a readable file, portably across machines.
+
+        A QCFractal spec is shared by every worker that may run the record, so a
+        machine-specific absolute path pins the record to one cluster (and one
+        username). Resolution order:
+
+        1. ``~`` and ``$VAR`` expansion, then the name as given (absolute or
+           relative to the worker's cwd);
+        2. if the name has no directory component, each entry of
+           ``$MACE_MODEL_PATH`` (os.pathsep-separated), so a spec can carry just
+           ``lmft-co-d-v0.model`` and each cluster points at its own model store
+           from the manager's ``worker_init``.
+
+        Note ``$VAR`` rarely survives a round trip: qcportal lowercases QCSpec
+        method strings server-side, so ``$MODELS`` comes back as ``$models``.
+        Prefer a bare filename plus ``$MACE_MODEL_PATH``, or a ``~``-relative
+        path (unaffected by lowercasing).
+
+        Returns the resolved path, or the expanded name unchanged when nothing
+        matched, so the caller raises a single consistent error.
+        """
+        expanded = os.path.expanduser(os.path.expandvars(name))
+        if os.path.isfile(expanded):
+            return expanded
+        if os.path.dirname(expanded):
+            return expanded
+        search = os.environ.get(cls.MODEL_PATH_ENV, "")
+        for root in (d for d in search.split(os.pathsep) if d):
+            candidate = os.path.join(os.path.expanduser(root), expanded)
+            if os.path.isfile(candidate):
+                return candidate
+        return expanded
+
     def load_model(self, name: str):
         """Compile and cache the model to make it faster when calling many times in serial"""
         model_name = name.lower()
-        if model_name in self._CACHE:
-            return self._CACHE[model_name]
-
-        import torch
-        from e3nn.util import jit
 
         if model_name in ["small", "medium", "large"]:
+            if model_name in self._CACHE:
+                return self._CACHE[model_name]
+            import torch  # noqa: F401
+            from e3nn.util import jit
             from mace.calculators.foundations_models import mace_off
 
             model = mace_off(model=model_name, return_raw_model=True)
+            cache_key = model_name
         else:
-            try:
-                model = torch.load(name, map_location=torch.device("cpu"))
-            except FileNotFoundError:
+            # Cache on the RESOLVED path so two spellings of the same file compile once.
+            resolved = self.resolve_model_path(model_name)
+            cache_key = resolved
+            if cache_key in self._CACHE:
+                return self._CACHE[cache_key]
+
+            import torch
+            from e3nn.util import jit
+
+            if not os.path.isfile(resolved):
+                searched = os.environ.get(self.MODEL_PATH_ENV) or "(unset)"
                 raise InputError(
-                    "The mace harness can only run local models or a MACE-OFF23 model (`small`, `medium`, `large`)"
+                    f"MACE model not found: {name!r} (resolved to {resolved!r}). "
+                    f"The mace harness runs a local model file or a MACE-OFF23 model "
+                    f"(`small`, `medium`, `large`). For a bare filename set "
+                    f"{self.MODEL_PATH_ENV} on the worker; it is currently {searched}."
                 )
+            model = torch.load(resolved, map_location=torch.device("cpu"))
+
         comp_mod = jit.compile(model)
-        self._CACHE[model_name] = (comp_mod, float(model.r_max), model.atomic_numbers)
-        return self._CACHE[model_name]
+        self._CACHE[cache_key] = (comp_mod, float(model.r_max), model.atomic_numbers)
+        return self._CACHE[cache_key]
 
     def compute(self, input_data: "AtomicInput", config: "TaskConfig") -> Union["AtomicResult", "FailedOperation"]:
 

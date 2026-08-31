@@ -38,7 +38,7 @@ import numpy as np
 from qcelemental.models.v2 import AtomicResult, BasisSet, Provenance
 from qcelemental.util import safe_version, which
 
-from ..exceptions import ConvergenceError, InputError, RandomError, UnknownError
+from ..exceptions import ConvergenceError, InputError, RandomError, ResourceError, UnknownError
 from ..util import execute, popen
 from .model import ProgramHarness
 from .util import error_stamp
@@ -208,32 +208,72 @@ class OrcaHarness(ProgramHarness):
     }
 
     version_cache: ClassVar[Dict[str, str]] = {}
+    # exe path -> is it really the ORCA quantum-chemistry program?
+    _identity_cache: ClassVar[Dict[str, bool]] = {}
 
-    @staticmethod
-    def found(raise_error: bool = False) -> bool:
-        return which(
-            "orca",
-            return_bool=True,
-            raise_error=raise_error,
-            raise_msg="Please install ORCA and make the `orca` binary available on PATH. "
-            "See https://www.faccts.de/orca/ or https://orcaforum.kofo.mpg.de",
-        )
+    _NOT_ORCA_MSG = (
+        "Please install ORCA and make the `orca` binary available on PATH. "
+        "See https://www.faccts.de/orca/ or https://orcaforum.kofo.mpg.de"
+    )
+
+    @classmethod
+    def _parse_version(cls, exe: str) -> Optional[str]:
+        """Return the ORCA version reported by ``exe``, or None if it isn't ORCA.
+
+        Many Linux distributions ship the GNOME screen reader as ``orca`` in
+        /usr/bin, so a bare ``which("orca")`` hit says nothing about whether the
+        quantum-chemistry program is present.
+        """
+        try:
+            with popen([exe, "--version"]) as exc:
+                exc["proc"].wait(timeout=30)
+            mobj = re.search(r"Program Version\s+([\d.]+)", exc["stdout"])
+        except Exception:
+            return None
+        return mobj.group(1) if mobj else None
+
+    @classmethod
+    def _is_orca(cls, exe: str) -> bool:
+        if exe not in cls._identity_cache:
+            cls._identity_cache[exe] = cls._parse_version(exe) is not None
+        return cls._identity_cache[exe]
+
+    @classmethod
+    def found(cls, raise_error: bool = False) -> bool:
+        """True only when a *real* ORCA is on PATH.
+
+        Validating here (rather than letting :meth:`get_version` raise) matters for
+        callers that enumerate harnesses: QCFractal's compute manager builds its
+        program list with ``get_version()`` over every *available* program, so a
+        harness that reports found-but-unusable aborts manager startup entirely
+        instead of simply being absent.
+        """
+        exe = which("orca", return_bool=False, raise_error=False)
+        if exe is not None and cls._is_orca(exe):
+            return True
+        if raise_error:
+            which("orca", raise_error=True, raise_msg=cls._NOT_ORCA_MSG)
+            # `orca` resolves but is not the QC program
+            raise ResourceError(
+                f"`orca` on PATH ({exe}) is not the ORCA quantum-chemistry program "
+                "(no 'Program Version' in `orca --version`); it is most likely the "
+                "GNOME screen reader. " + cls._NOT_ORCA_MSG
+            )
+        return False
 
     def get_version(self) -> str:
         self.found(raise_error=True)
 
         which_prog = which("orca")
         if which_prog not in self.version_cache:
-            with popen([which_prog, "--version"]) as exc:
-                exc["proc"].wait(timeout=30)
-            mobj = re.search(r"Program Version\s+([\d.]+)", exc["stdout"])
-            if mobj is None:
+            version = self._parse_version(which_prog)
+            if version is None:
                 raise UnknownError(
                     "Could not parse an ORCA version from `orca --version`. "
                     "Note: on some Linux systems `orca` on PATH is the GNOME screen reader, "
                     "not the ORCA quantum chemistry program."
                 )
-            self.version_cache[which_prog] = safe_version(mobj.group(1))
+            self.version_cache[which_prog] = safe_version(version)
 
         return self.version_cache[which_prog]
 
