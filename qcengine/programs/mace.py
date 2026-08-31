@@ -97,6 +97,7 @@ class MACEHarness(ProgramHarness):
         return self.version_cache[which_prog]
 
     MODEL_PATH_ENV: ClassVar[str] = "MACE_MODEL_PATH"
+    DTYPE_ENV: ClassVar[str] = "MACE_DTYPE"
 
     @classmethod
     def resolve_model_path(cls, name: str) -> str:
@@ -136,24 +137,29 @@ class MACEHarness(ProgramHarness):
     def load_model(self, name: str):
         """Compile and cache the model to make it faster when calling many times in serial"""
         model_name = name.lower()
+        import torch
+
+        # Weights are cast to the active default dtype: MACE checkpoints are stored
+        # in float64, so under MACE_DTYPE=float32 the inputs would be float32 while
+        # the weights stayed float64 ("both inputs should have same dtype"). The
+        # cache is keyed on the dtype too, since a compiled model is dtype-specific.
+        dtype = torch.get_default_dtype()
 
         if model_name in ["small", "medium", "large"]:
-            if model_name in self._CACHE:
-                return self._CACHE[model_name]
-            import torch  # noqa: F401
+            cache_key = (model_name, dtype)
+            if cache_key in self._CACHE:
+                return self._CACHE[cache_key]
             from e3nn.util import jit
             from mace.calculators.foundations_models import mace_off
 
             model = mace_off(model=model_name, return_raw_model=True)
-            cache_key = model_name
         else:
             # Cache on the RESOLVED path so two spellings of the same file compile once.
             resolved = self.resolve_model_path(model_name)
-            cache_key = resolved
+            cache_key = (resolved, dtype)
             if cache_key in self._CACHE:
                 return self._CACHE[cache_key]
 
-            import torch
             from e3nn.util import jit
 
             if not os.path.isfile(resolved):
@@ -166,6 +172,7 @@ class MACEHarness(ProgramHarness):
                 )
             model = torch.load(resolved, map_location=torch.device("cpu"))
 
+        model = model.to(dtype=dtype)
         comp_mod = jit.compile(model)
         self._CACHE[cache_key] = (comp_mod, float(model.r_max), model.atomic_numbers)
         return self._CACHE[cache_key]
@@ -181,7 +188,16 @@ class MACEHarness(ProgramHarness):
         from mace.data.utils import AtomicNumberTable, Configuration
         from mace.tools.torch_geometric import DataLoader
 
-        torch.set_default_dtype(torch.float64)
+        # Precision from $MACE_DTYPE (default float64). float32 roughly halves
+        # activation memory, which is what lets large systems fit a GPU for
+        # *geometry* work: a 1500-atom periodic slab needs ~43 GB of a 44 GB L40S
+        # in float64 and OOMs, ~21 GB in float32. Binding energies still want
+        # float64 (float32 noise is comparable to a physisorption well), and the
+        # BE single-points are energy-only so they fit. Opt in per manager via
+        # worker_init, so precision is a deployment choice, not a code change.
+        torch.set_default_dtype(
+            torch.float32 if os.environ.get(self.DTYPE_ENV, "").lower() == "float32" else torch.float64
+        )
 
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         # Failure flag

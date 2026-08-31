@@ -166,3 +166,46 @@ def test_mace_energy_matches_between_cpu_and_gpu(tmp_path, monkeypatch):
     monkeypatch.setattr(torch.cuda, "is_available", lambda: False)
     cpu = qcng.compute(mk(), "mace", raise_error=True).return_result
     assert gpu == pytest.approx(cpu, rel=1e-8)
+
+
+# ---------------------------------------------------------------------------
+# Precision selection. float64 is the default (binding energies need it), but a
+# 1500-atom periodic slab needs ~43 GB of a 44 GB L40S in float64 and OOMs;
+# float32 halves that and is fine for geometry optimization.
+# ---------------------------------------------------------------------------
+
+def test_mace_dtype_defaults_to_float64_and_honours_the_env(monkeypatch):
+    torch = pytest.importorskip("torch")
+    import qcelemental as qcel
+    import qcengine as qcng
+
+    model = os.environ.get("MACE_TEST_MODEL")
+    if not model or not os.path.isfile(model):
+        pytest.skip("set MACE_TEST_MODEL to a local .model file")
+    mol = qcel.models.Molecule.from_data("O 0 0 0\nH 0.96 0 0\nH -0.24 0.93 0")
+    inp = lambda: qcel.models.AtomicInput(
+        molecule=mol, driver="energy", model={"method": model, "basis": None}, keywords={}
+    )
+
+    monkeypatch.delenv("MACE_DTYPE", raising=False)
+    qcng.compute(inp(), "mace", raise_error=True)
+    assert torch.get_default_dtype() is torch.float64
+
+    monkeypatch.setenv("MACE_DTYPE", "float32")
+    qcng.compute(inp(), "mace", raise_error=True)
+    assert torch.get_default_dtype() is torch.float32
+
+    monkeypatch.setenv("MACE_DTYPE", "float64")
+    qcng.compute(inp(), "mace", raise_error=True)
+    assert torch.get_default_dtype() is torch.float64
+
+
+def test_mace_dtype_is_read_from_env_not_hardcoded():
+    """Source-level guard: runs on CPU-only CI, catches a revert to a fixed dtype."""
+    import inspect
+
+    from qcengine.programs.mace import MACEHarness
+
+    src = inspect.getsource(MACEHarness.compute)
+    assert "self.DTYPE_ENV" in src, "precision must come from $MACE_DTYPE"
+    assert "torch.set_default_dtype(torch.float64)" not in src, "dtype must not be hardcoded"
