@@ -6,6 +6,7 @@ from typing import Set
 
 from ..exceptions import InputError, ResourceError
 from .berny import BernyProcedure
+from .ase import ASEProcedure
 from .geometric import GeometricProcedure
 from .model import ProcedureHarness
 from .nwchem_opt import NWChemDriverProcedure
@@ -67,6 +68,7 @@ def list_available_procedures() -> Set[str]:
     return ret
 
 
+register_procedure(ASEProcedure())
 register_procedure(GeometricProcedure())
 register_procedure(OptKingProcedure())
 register_procedure(BernyProcedure())
