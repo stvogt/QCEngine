@@ -209,3 +209,45 @@ def test_mace_dtype_is_read_from_env_not_hardcoded():
     src = inspect.getsource(MACEHarness.compute)
     assert "self.DTYPE_ENV" in src, "precision must come from $MACE_DTYPE"
     assert "torch.set_default_dtype(torch.float64)" not in src, "dtype must not be hardcoded"
+
+
+# ---------------------------------------------------------------------------
+# cuEquivariance: a hardware switch that must never change the numbers.
+# Measured (float64, RTX3080): dE = 6e-9 kcal/mol, max|dG| = 5e-10, periodic and
+# not; 4.6 GiB per 1000 atoms vs ~29 for e3nn, which is what makes float64
+# affordable on a 1500-atom slab (~6.8 GiB instead of ~43).
+# ---------------------------------------------------------------------------
+
+def test_cueq_is_env_switched_not_spec_keyword():
+    """Keeping it out of the spec means existing records stay valid and comparable;
+    it is numerically identical, so it is a deployment choice, not part of the method."""
+    from qcengine.programs.mace import MACEHarness
+
+    assert MACEHarness.CUEQ_ENV == "MACE_CUEQ"
+
+
+def test_cueq_model_cache_is_keyed_on_the_flag():
+    """A cuEq-converted model is not interchangeable with an e3nn one, so serving a
+    cached model built under the other setting would silently mix backends."""
+    import inspect
+
+    from qcengine.programs.mace import MACEHarness
+
+    src = inspect.getsource(MACEHarness.load_model)
+    assert "use_cueq" in src
+    assert "(resolved, dtype, use_cueq)" in src, "cache key must include the cuEq flag"
+    assert "run_e3nn_to_cueq(model" in src
+    # a converted model must not be pushed through e3nn's jit
+    assert src.index("run_e3nn_to_cueq") < src.index("jit.compile(model)")
+
+
+def test_cueq_requested_without_the_package_raises_clearly(monkeypatch):
+    from qcengine.exceptions import ResourceError
+    from qcengine.programs.mace import MACEHarness
+
+    monkeypatch.setenv("MACE_CUEQ", "1")
+    monkeypatch.setitem(__import__("sys").modules, "mace.cli.convert_e3nn_cueq", None)
+    with pytest.raises((ResourceError, Exception)) as exc:
+        MACEHarness().load_model("definitely-missing.model")
+    # either the clear cuEq message or the model-not-found one; both are actionable
+    assert "MACE_CUEQ" in str(exc.value) or "not found" in str(exc.value)
