@@ -170,3 +170,58 @@ def test_non_convergence_is_an_error_not_a_silent_result():
     res = qcng.compute(inp, "ase", raise_error=False)
     assert not res.success
     assert "did not converge" in str(res.error.error_message)
+
+
+# ---------------------------------------------------------------------------
+# Preconditioner stabilisation. ASE adds the diagonal stabilisation only when
+# there are NO fixed atoms, assuming constraints remove the singular modes. That
+# fails when a mobile fragment drifts beyond r_cut of everything else: it gets an
+# empty neighbour list, a zero diagonal entry, and an EXACTLY SINGULAR matrix.
+# Observed on ~19% of periodic slab sites (adsorbate desorbing into the vacuum
+# gap); each stuck worker then spun in C at 100% CPU, never calling the
+# calculator, until the queue deadlocked.
+# ---------------------------------------------------------------------------
+
+def test_precon_forces_stabilisation_by_default():
+    import inspect
+
+    from qcengine.procedures.ase import _build_optimizer
+
+    src = inspect.getsource(_build_optimizer)
+    assert 'keywords.get("precon_force_stab", True)' in src
+
+
+def test_precon_matrix_is_nonsingular_for_a_detached_fragment():
+    """The real failure: fixed atoms present AND a fragment outside r_cut of everything.
+
+    Without force_stab the preconditioner is exactly singular and spsolve produces
+    garbage; with it the solve is well posed.
+    """
+    import warnings
+
+    import numpy as np
+    from ase import Atoms
+    from ase.constraints import FixAtoms
+    from ase.optimize.precon import Exp
+
+    # small slab-like block, plus a molecule parked far away in "vacuum"
+    pos = [[i * 2.0, j * 2.0, 0.0] for i in range(4) for j in range(4)]
+    pos += [[3.0, 3.0, 40.0], [3.0, 3.0, 41.1]]     # detached, >> r_cut from the block
+    atoms = Atoms("H16CO", positions=pos, cell=[20.0, 20.0, 80.0], pbc=[True, True, False])
+    atoms.set_constraint(FixAtoms(indices=list(range(8))))   # fixed atoms present
+    from ase.calculators.lj import LennardJones
+
+    atoms.calc = LennardJones(rc=6.0)   # make_precon estimates mu from forces
+
+    for force_stab, expect_singular in [(False, True), (True, False)]:
+        precon = Exp(A=3.0, r_cut=5.0, r_NN=1.0, force_stab=force_stab)
+        precon.make_precon(atoms)
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            y = precon.solve(np.ones(precon.P.shape[0]))
+        singular = any("singular" in str(w.message).lower() for w in caught) or not np.all(
+            np.isfinite(y)
+        )
+        assert singular is expect_singular, (
+            f"force_stab={force_stab}: expected singular={expect_singular}, got {singular}"
+        )

@@ -103,10 +103,27 @@ def _build_optimizer(name: str, atoms, keywords: Dict[str, Any]):
         # The Exp preconditioner auto-detects a nearest-neighbour scale, which fails on
         # finite clusters in vacuum ("increased r_cut to twice system extent"). Let the
         # caller pin it; the defaults suit condensed/periodic systems.
+        #
+        # force_stab defaults to True here, unlike ASE. ASE only adds the diagonal
+        # stabilisation when there are NO fixed atoms:
+        #
+        #     if force_stab or len(fixed_atoms) == 0:
+        #         diag_coeff += self.mu * self.c_stab
+        #
+        # assuming constraints remove the singular modes. That assumption fails whenever a
+        # mobile fragment drifts beyond r_cut of everything else -- an adsorbate desorbing
+        # into a vacuum gap gets an empty neighbour list, hence a zero diagonal entry, hence
+        # an EXACTLY SINGULAR matrix. spsolve then returns garbage, no downhill direction is
+        # ever found, and the optimizer spins in C at 100% CPU without calling the
+        # calculator again (unresponsive even to SIGINT). Observed on ~19% of periodic slab
+        # sites, where each stuck worker held its slot until the queue deadlocked.
+        # Since this workflow always freezes slab layers and adsorbates can always desorb,
+        # stabilisation must be unconditional.
         precon = Exp(
             A=keywords.get("precon_A", 3.0),
             r_cut=keywords.get("precon_r_cut", None),
             r_NN=keywords.get("precon_r_NN", None),
+            force_stab=keywords.get("precon_force_stab", True),
         )
         opt = PreconLBFGS(atoms, precon=precon, use_armijo=keywords.get("use_armijo", True), logfile=None)
         return opt
