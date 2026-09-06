@@ -225,3 +225,81 @@ def test_precon_matrix_is_nonsingular_for_a_detached_fragment():
         assert singular is expect_singular, (
             f"force_stab={force_stab}: expected singular={expect_singular}, got {singular}"
         )
+
+
+# ---------------------------------------------------------------------------
+# charge / multiplicity survive the per-gradient molecule rebuild
+# ---------------------------------------------------------------------------
+
+def _spec_and_stub(monkeypatch, natom):
+    """Patch qcengine.compute to capture the rebuilt molecule and return a stub."""
+    from types import SimpleNamespace
+
+    import qcengine
+    from qcelemental.models.v2 import AtomicSpecification, DriverEnum
+
+    seen = {}
+
+    def fake_compute(atomic_input, program, **kwargs):
+        seen["molecule"] = atomic_input.molecule
+        return SimpleNamespace(
+            return_result=np.zeros((natom, 3)),
+            properties=SimpleNamespace(return_energy=-1.0),
+        )
+
+    monkeypatch.setattr(qcengine, "compute", fake_compute)
+    spec = AtomicSpecification(
+        program="mace", driver=DriverEnum.energy,
+        model={"method": "dummy.model", "basis": None}, keywords={},
+    )
+    return spec, seen
+
+
+def test_calculator_carries_charge_and_multiplicity(monkeypatch):
+    """ASE returns bare positions, so the molecule is rebuilt at every gradient.
+
+    Charge and multiplicity cannot be recovered from coordinates. If they are not
+    carried over from the input they fall back to a neutral singlet, which is merely
+    wrong for a closed-shell adsorbate but *impossible* for an odd-electron system
+    such as CH3 on a slab -- qcelemental then rejects every single step with
+    "Inconsistent or unspecified chg/mult".
+    """
+    from qcelemental.models.v2 import Molecule
+    from qcengine.procedures.ase import _QCEngineCalculator
+
+    symbols = ["C", "H", "H", "H"]
+    positions = np.array([[0.0, 0.0, 0.0], [1.08, 0.0, 0.0],
+                          [-0.54, 0.94, 0.0], [-0.54, -0.94, 0.0]])
+    reference = Molecule(
+        symbols=symbols,
+        geometry=(positions / 0.52917721092).flatten(),
+        molecular_charge=0.0,
+        molecular_multiplicity=2,
+        fix_com=True,
+        fix_orientation=True,
+        validate=False,
+    )
+    spec, seen = _spec_and_stub(monkeypatch, len(symbols))
+
+    calc = _QCEngineCalculator(spec, "mace", {}, reference_molecule=reference)
+    atoms = ase.Atoms(symbols=symbols, positions=positions)
+    calc.atoms = atoms
+    calc.get_forces(atoms)
+
+    assert seen["molecule"].molecular_multiplicity == 2
+    assert seen["molecule"].molecular_charge == 0.0
+
+
+def test_calculator_without_reference_defaults_to_neutral_singlet(monkeypatch):
+    """Documents the fallback: right for closed shell, and the only sane default."""
+    from qcengine.procedures.ase import _QCEngineCalculator
+
+    spec, seen = _spec_and_stub(monkeypatch, 3)
+    calc = _QCEngineCalculator(spec, "mace", {}, reference_molecule=None)
+    atoms = ase.Atoms(symbols=["O", "H", "H"],
+                      positions=np.array([[0.0, 0.0, 0.0], [0.96, 0.0, 0.0], [-0.24, 0.93, 0.0]]))
+    calc.atoms = atoms
+    calc.get_forces(atoms)
+
+    assert seen["molecule"].molecular_multiplicity == 1
+    assert seen["molecule"].molecular_charge == 0.0

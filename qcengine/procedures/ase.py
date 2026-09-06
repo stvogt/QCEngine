@@ -141,11 +141,17 @@ class _QCEngineCalculator:
 
     implemented_properties = ("energy", "forces", "free_energy")
 
-    def __init__(self, spec, program: str, task_config):
+    def __init__(self, spec, program: str, task_config, reference_molecule=None):
         from ase.calculators.calculator import Calculator
 
         self._spec = spec
         self._program = program
+        # ASE hands back bare positions, so each gradient rebuilds the molecule from
+        # scratch. Charge and multiplicity are not recoverable from coordinates and must
+        # be carried over from the input, or they silently fall back to neutral singlet:
+        # harmless for closed-shell adsorbates, fatal for an odd-electron system such as
+        # CH3 on a slab, where mult=1 is impossible and validation rejects every step.
+        self._reference_molecule = reference_molecule
         # qcengine.compute() takes a plain mapping, not a TaskConfig model
         self._task_config = task_config.model_dump() if hasattr(task_config, "model_dump") else task_config
         self.results: Dict[str, Any] = {}
@@ -181,9 +187,12 @@ class _QCEngineCalculator:
         if self._cached_positions is not None and self.results and np.array_equal(positions, self._cached_positions):
             return self.results
         positions_bohr = positions / BOHR_TO_ANGSTROM
+        ref = self._reference_molecule
         molecule = Molecule(
             symbols=[str(s) for s in atoms.get_chemical_symbols()],
             geometry=positions_bohr.flatten(),
+            molecular_charge=0.0 if ref is None else ref.molecular_charge,
+            molecular_multiplicity=1 if ref is None else ref.molecular_multiplicity,
             fix_com=True,
             fix_orientation=True,
             validate=False,
@@ -269,7 +278,7 @@ class ASEProcedure(ProcedureHarness):
 
             atoms.set_constraint(FixAtoms(indices=frozen))
 
-        calculator = _QCEngineCalculator(qc_spec, program, config)
+        calculator = _QCEngineCalculator(qc_spec, program, config, reference_molecule=molecule)
         calculator.atoms = atoms
         atoms.calc = calculator
 
