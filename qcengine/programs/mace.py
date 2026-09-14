@@ -135,8 +135,12 @@ class MACEHarness(ProgramHarness):
                 return candidate
         return expanded
 
-    def load_model(self, name: str):
-        """Compile and cache the model to make it faster when calling many times in serial"""
+    def load_model(self, name: str, device: str = "cpu"):
+        """Compile and cache the model to make it faster when calling many times in serial.
+
+        ``device`` is where the model will run; the cuEq conversion needs it because
+        ``conv_fusion`` is only enabled for ``"cuda"``.
+        """
         model_name = name.lower()
         import torch
 
@@ -194,7 +198,11 @@ class MACEHarness(ProgramHarness):
                 ) from exc
             # NB: a converted model must NOT go through e3nn's jit.compile -- cuEq
             # supplies its own fused ops, and MACE's own calculator likewise skips it.
-            comp_mod = run_e3nn_to_cueq(model, return_model=True)
+            # Pass the target device: convert_e3nn_cueq sets conv_fusion=(device=="cuda"),
+            # and without the fused convolution the first tensor product materialises
+            # its per-edge output (8 GiB for a 1500-atom slab in float64), which is
+            # exactly the allocation cuEq is meant to avoid. MACECalculator does the same.
+            comp_mod = run_e3nn_to_cueq(model, device=device, return_model=True)
         else:
             comp_mod = jit.compile(model)
         self._CACHE[cache_key] = (comp_mod, float(model.r_max), model.atomic_numbers)
@@ -230,7 +238,7 @@ class MACEHarness(ProgramHarness):
         method = input_data.specification.model.method
 
         # load the torch model which can be a MACE-OFF23 or local model
-        model, r_max, atomic_numbers = self.load_model(name=method)
+        model, r_max, atomic_numbers = self.load_model(name=method, device=device.type)
 
         z_table = AtomicNumberTable([int(z) for z in atomic_numbers])
         atomic_numbers = input_data.molecule.atomic_numbers
