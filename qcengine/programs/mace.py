@@ -59,6 +59,45 @@ def _parse_periodic_keywords(
     return pbc_tuple, cell
 
 
+def _parse_hessian_keywords(keywords: Optional[Dict[str, Any]], natom: int) -> Tuple[list, str, float]:
+    """Hessian settings from a QC-spec keywords dict (all optional).
+
+    ``active_atoms``    0-based atom indices of the partial Hessian (PHVA): only these atoms are displaced
+                        / differentiated, all other atoms stay in the calculation as a fixed environment.
+                        Default: all atoms (the full Hessian).
+    ``hessian_method``  ``"fd"`` (default; central differences of the forces) or ``"analytic"`` (autograd
+                        rows of the force graph).
+    ``fd_step``         finite-difference displacement in Angstrom (default 0.005).
+
+    Returns ``(active, method, step)``; ``active`` keeps the order given.
+    """
+    kw = keywords or {}
+    active = kw.get("active_atoms")
+    if active is None:
+        active = list(range(natom))
+    else:
+        try:
+            active = [int(i) for i in active]
+        except (TypeError, ValueError):
+            raise InputError("MACE harness: keywords['active_atoms'] must be a list of atom indices.")
+        if not active:
+            raise InputError("MACE harness: keywords['active_atoms'] is empty.")
+        if len(set(active)) != len(active):
+            raise InputError("MACE harness: keywords['active_atoms'] has repeated indices.")
+        if min(active) < 0 or max(active) >= natom:
+            raise InputError(
+                f"MACE harness: keywords['active_atoms'] must lie in 0..{natom - 1} "
+                f"(got {min(active)}..{max(active)})."
+            )
+    method = str(kw.get("hessian_method", "fd")).lower()
+    if method not in ("fd", "analytic"):
+        raise InputError(f"MACE harness: keywords['hessian_method'] must be 'fd' or 'analytic' (got {method!r}).")
+    step = float(kw.get("fd_step", 0.005))
+    if not step > 0:
+        raise InputError("MACE harness: keywords['fd_step'] must be positive (Angstrom).")
+    return active, method, step
+
+
 class MACEHarness(ProgramHarness):
     """Can be used to execute a published MACE-OFF23 model or local mace model.
     For more info on the MACE-OFF23 models see <https://doi.org/10.48550/arXiv.2312.15211>.
@@ -251,35 +290,39 @@ class MACEHarness(ProgramHarness):
         # Configuration arguments (training labels; empty for inference).
         # Fall back to the old signature for older mace versions.
         positions = input_data.molecule.geometry * ureg.conversion_factor("bohr", "angstrom")
-        try:
-            config = Configuration(
-                atomic_numbers=atomic_numbers,
-                positions=positions,
-                pbc=pbc,
-                cell=cell,
-                properties={},
-                property_weights={},
-            )
-        except TypeError:
-            config = Configuration(
-                atomic_numbers=atomic_numbers,
-                positions=positions,
-                pbc=pbc,
-                cell=cell,
-            )
 
-        data_loader = DataLoader(
-            dataset=[AtomicData.from_config(config, z_table=z_table, cutoff=r_max)],
-            batch_size=1,
-            shuffle=False,
-            drop_last=False,
-        )
+        def build_input(pos):
+            """Model input (dict on the model's device) for positions in Angstrom; the neighbour
+            list is rebuilt, so it is valid for displaced geometries too."""
+            try:
+                config = Configuration(
+                    atomic_numbers=atomic_numbers,
+                    positions=pos,
+                    pbc=pbc,
+                    cell=cell,
+                    properties={},
+                    property_weights={},
+                )
+            except TypeError:
+                config = Configuration(
+                    atomic_numbers=atomic_numbers,
+                    positions=pos,
+                    pbc=pbc,
+                    cell=cell,
+                )
+            data_loader = DataLoader(
+                dataset=[AtomicData.from_config(config, z_table=z_table, cutoff=r_max)],
+                batch_size=1,
+                shuffle=False,
+                drop_last=False,
+            )
+            # GPU-safe: move the input batch onto the model's device (no-op on CPU).
+            # Without this, model on cuda + data on cpu raises
+            # "Expected all tensors to be on the same device".
+            return next(iter(data_loader)).to(device).to_dict()
+
         model.to(device)
-        # GPU-safe: move the input batch onto the model's device (no-op on CPU).
-        # Without this, model on cuda + data on cpu raises
-        # "Expected all tensors to be on the same device".
-        batch = next(iter(data_loader)).to(device)
-        input_dict = batch.to_dict()
+        input_dict = build_input(positions)
         mace_data = model(input_dict, compute_force=True)
         # Bring results back to host before pint/numpy/JSON serialization:
         # .numpy() raises on CUDA tensors.
@@ -296,8 +339,56 @@ class MACEHarness(ProgramHarness):
                 .tolist()
             )
 
+        elif input_data.specification.driver == "hessian":
+            # Partial Hessian (PHVA) of keywords['active_atoms'] (default: all atoms, the full Hessian).
+            # Every model call is on the whole system: the fixed atoms are the environment of the active
+            # ones. Only the active block is computed and returned, (3 n_active) x (3 n_active), atoms in
+            # the order of 'active_atoms', coordinates x, y, z.
+            active, hess_method, step = _parse_hessian_keywords(input_data.specification.keywords, len(atomic_numbers))
+            pos0 = np.array(positions, dtype=float).reshape(-1, 3)
+            cols = torch.as_tensor(active, device=device)
+            ndof = 3 * len(active)
+            if hess_method == "fd":
+                # central differences of the forces: two force calls per active coordinate
+                hess = np.zeros((ndof, ndof))
+                for a, i in enumerate(active):
+                    for k in range(3):
+                        f = []
+                        for sign in (+1.0, -1.0):
+                            pos = pos0.copy()
+                            pos[i, k] += sign * step
+                            out = model(build_input(pos), compute_force=True)
+                            f.append(out["forces"].detach()[cols].reshape(-1).cpu().numpy())
+                        hess[3 * a + k] = -(f[0] - f[1]) / (2.0 * step)
+            else:
+                # analytic: one backward pass through the force graph per active coordinate
+                # (training=True keeps the graph of the forces); columns restricted to the active atoms
+                inp = build_input(pos0)
+                out = model(inp, compute_force=True, training=True)
+                forces, pos_t = out["forces"], inp["positions"]
+                rows = []
+                for i in active:
+                    for k in range(3):
+                        (g,) = torch.autograd.grad(forces[i, k], pos_t, retain_graph=True)
+                        rows.append(-g[cols].reshape(-1).detach())
+                hess = torch.stack(rows).cpu().numpy()
+            hess = 0.5 * (hess + hess.T)
+            ret_data["return_result"] = (
+                (hess * ureg.conversion_factor("eV / angstrom**2", "hartree / bohr**2")).ravel().tolist()
+            )
+            ret_data["extras"] = {
+                "mace_hessian": {
+                    "active_atoms": active,
+                    "partial": len(active) < len(atomic_numbers),
+                    "method": hess_method,
+                    "fd_step_angstrom": step if hess_method == "fd" else None,
+                    "n_atoms": len(atomic_numbers),
+                    "layout": "(3 n_active) x (3 n_active), atoms in the order of active_atoms, xyz; symmetrized",
+                }
+            }
+
         else:
-            raise InputError("MACE only supports the energy and gradient driver methods.")
+            raise InputError("MACE only supports the energy, gradient and hessian driver methods.")
 
         ret_data["input_data"] = input_data
         ret_data["molecule"] = input_data.molecule
